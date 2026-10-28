@@ -5,65 +5,62 @@ import pandas as pd
 from src.recommend import recommend_for_users
 
 
-def find_col(df, expected, alternatives=()):
-    if expected in df.columns:
-        return expected
-    for col in alternatives:
-        if col in df.columns:
-            return col
-    raise ValueError(f"Could not find {expected!r}. Available columns: {df.columns.tolist()}")
-
-
 def main():
-    p = argparse.ArgumentParser(description="Evaluate popularity baseline and/or create submission CSV")
-    p.add_argument("--data-dir", type=Path, default=Path("data"))
-    p.add_argument("--sample", type=Path, default=None)
-    p.add_argument("--output", type=Path, default=Path("submission.csv"))
-    p.add_argument("--k", type=int, default=10)
-    p.add_argument("--rating-col", default="rating")
-    p.add_argument("--positive-mode", choices=["all", "threshold"], default="all")
-    p.add_argument("--threshold", type=float, default=4.0)
-    p.add_argument("--time-col", default="timestamp")
-    p.add_argument("--half-life-days", type=float, default=None)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Generate submission in the supplied sample format")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--sample", type=Path, default=None)
+    parser.add_argument("--output", type=Path, default=Path("submission.csv"))
+    parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--positive-mode", choices=["all", "threshold"], default="all")
+    parser.add_argument("--threshold", type=float, default=4.0)
+    parser.add_argument("--half-life", type=float, default=None,
+                        help="Optional time-decay half-life in timestamp units")
+    args = parser.parse_args()
 
-    data_dir = args.data_dir
-    events = pd.read_csv(data_dir / "events.csv")
-    sample_path = args.sample or data_dir / "submission_sample.csv"
-    sample = pd.read_csv(sample_path) if sample_path.exists() else None
-    user_col = find_col(events, "user_id", ("user",))
-    item_col = find_col(events, "item_id", ("item",))
-    rating_col = args.rating_col if args.rating_col in events.columns else None
-    time_col = args.time_col if args.time_col in events.columns else None
+    events = pd.read_csv(args.data_dir / "events.csv")
+    sample_path = args.sample or args.data_dir / "submission_sample.csv"
+    sample = pd.read_csv(sample_path)
+    items = pd.read_csv(args.data_dir / "item_features.csv")
 
-    if sample is not None:
-        sample_user = find_col(sample, "user_id", ("user",))
-        sample_item = find_col(sample, "item_id", ("item",))
-        # If sample contains one row per recommendation slot, use unique users.
-        users = sample[sample_user].drop_duplicates().tolist()
-        user_col_out, item_col_out = sample_user, sample_item
-    else:
-        users = events[user_col].drop_duplicates().tolist()
-        user_col_out, item_col_out = user_col, item_col
+    required_events = {"user_id", "item_id"}
+    if not required_events.issubset(events.columns):
+        raise ValueError(f"events.csv must contain {required_events}; found {events.columns.tolist()}")
+    if not {"user_id", "item_id"}.issubset(sample.columns):
+        raise ValueError("submission_sample.csv must contain user_id and item_id columns")
+    if "item_id" not in items.columns:
+        raise ValueError("item_features.csv must contain item_id")
 
+    users = sample["user_id"].drop_duplicates().tolist()
+    catalog = items["item_id"].drop_duplicates().tolist()
+    rating_col = "rating" if "rating" in events.columns else None
+    time_col = "timestamp" if "timestamp" in events.columns else None
     recs = recommend_for_users(
-        events, users, k=args.k, user_col=user_col, item_col=item_col,
+        events, users, k=args.k, user_col="user_id", item_col="item_id",
         rating_col=rating_col, positive_mode=args.positive_mode,
-        threshold=args.threshold, time_col=time_col,
-        half_life_days=args.half_life_days, exclude_seen=True
+        threshold=args.threshold, time_col=time_col, half_life=args.half_life,
+        catalog_items=catalog, exclude_seen=True
     )
-    recs = recs.rename(columns={user_col: user_col_out, item_col: item_col_out})
-    recs = recs[[user_col_out, item_col_out]].copy()
 
-    # Exact required output schema and string IDs.
-    recs[user_col_out] = recs[user_col_out].astype(str)
-    recs[item_col_out] = recs[item_col_out].astype(str)
-    recs.to_csv(args.output, index=False)
-    print(f"Saved {len(recs):,} recommendations to {args.output}")
-    print(f"Users: {recs[user_col_out].nunique():,}; rows per user (min/max): "
-          f"{recs.groupby(user_col_out).size().min()}/{recs.groupby(user_col_out).size().max()}")
-    if sample is not None:
-        print(f"Output columns: {recs.columns.tolist()}; sample columns: {[user_col_out, item_col_out]}")
+    # The provided sample has ONE ROW PER USER; item_id is a space-separated
+    # string containing exactly 10 item IDs, not one row per recommendation.
+    grouped = recs.sort_values(["user_id", "rank"]).groupby("user_id")["item_id"].apply(
+        lambda values: " ".join(str(x) for x in values)
+    )
+    output = pd.DataFrame({"user_id": users})
+    output["item_id"] = output["user_id"].map(grouped).fillna("")
+    output["user_id"] = output["user_id"].astype(str)
+    output["item_id"] = output["item_id"].astype(str)
+
+    # Match sample schema and row order, including any user with no available recs.
+    output = output[["user_id", "item_id"]]
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    output.to_csv(args.output, index=False)
+    lengths = output["item_id"].str.split().str.len()
+    print(f"Saved: {args.output}")
+    print(f"Users: {len(output)}; rows with exactly {args.k} recommendations: {(lengths == args.k).sum()}")
+    print(f"Output columns: {output.columns.tolist()}")
+    if (lengths != args.k).any():
+        print("WARNING: some users have fewer than k recommendations; check catalogue size and exclusions.")
 
 
 if __name__ == "__main__":

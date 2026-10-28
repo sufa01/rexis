@@ -8,35 +8,34 @@ from src.metrics import recall_at_k_frame
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", type=Path, default=Path("data"))
-    p.add_argument("--k", type=int, default=10)
-    p.add_argument("--rating-col", default="rating")
-    p.add_argument("--positive-mode", choices=["all", "threshold"], default="all")
-    p.add_argument("--threshold", type=float, default=4.0)
-    p.add_argument("--time-col", default="timestamp")
-    p.add_argument("--half-life-days", type=float, default=None)
-    p.add_argument("--output", type=Path, default=Path("reports/validation_predictions.csv"))
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Evaluate global-popularity baseline with leave-last-out")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--positive-mode", choices=["all", "threshold"], default="all")
+    parser.add_argument("--threshold", type=float, default=4.0)
+    parser.add_argument("--half-life", type=float, default=None,
+                        help="Optional decay half-life in timestamp units")
+    parser.add_argument("--output", type=Path, default=Path("reports/validation_predictions.csv"))
+    args = parser.parse_args()
 
     events = pd.read_csv(args.data_dir / "events.csv")
+    items = pd.read_csv(args.data_dir / "item_features.csv")
     for col in ("user_id", "item_id"):
         if col not in events.columns:
             raise ValueError(f"events.csv must contain {col!r}; found {events.columns.tolist()}")
-    rating_col = args.rating_col if args.rating_col in events.columns else None
-    time_col = args.time_col if args.time_col in events.columns else None
 
-    # For threshold-based evaluation, filter positives before splitting so the held-out
-    # target is guaranteed to be a positive event. The history still comes from all events.
+    time_col = "timestamp" if "timestamp" in events.columns else None
+    rating_col = "rating" if "rating" in events.columns else None
+
+    # The target is the latest positive event if threshold mode is used.
+    # The full event history is retained for training except the held-out pair.
     if args.positive_mode == "threshold":
-        if not rating_col:
-            raise ValueError("threshold mode requested but rating column is missing")
-        positives = events[pd.to_numeric(events[rating_col], errors="coerce") >= args.threshold]
-        _, truth = leave_last_out(positives, "user_id", "item_id", time_col)
-        # Keep each target user's full history except the held-out target item.
-        train = events[~events.set_index(["user_id", "item_id"]).index.isin(
-            truth.set_index(["user_id", "item_id"]).index
-        )].copy()
+        if rating_col is None:
+            raise ValueError("threshold mode requires a rating column")
+        positive = events[pd.to_numeric(events[rating_col], errors="coerce") >= args.threshold]
+        _, truth = leave_last_out(positive, "user_id", "item_id", time_col)
+        heldout = set(zip(truth["user_id"], truth["item_id"]))
+        train = events[[ (u, i) not in heldout for u, i in zip(events["user_id"], events["item_id"]) ]].copy()
     else:
         train, truth = leave_last_out(events, "user_id", "item_id", time_col)
 
@@ -44,8 +43,8 @@ def main():
     recs = recommend_for_users(
         train, users, k=args.k, user_col="user_id", item_col="item_id",
         rating_col=rating_col, positive_mode=args.positive_mode,
-        threshold=args.threshold, time_col=time_col,
-        half_life_days=args.half_life_days, exclude_seen=True
+        threshold=args.threshold, time_col=time_col, half_life=args.half_life,
+        catalog_items=items["item_id"].drop_duplicates().tolist(), exclude_seen=True
     )
     score = recall_at_k_frame(recs, truth, args.k)
     args.output.parent.mkdir(parents=True, exist_ok=True)
