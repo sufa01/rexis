@@ -1,6 +1,6 @@
 PYTHON ?= python
 
-.PHONY: run eda validate submission
+.PHONY: run eda validate submission classic
 
 run: eda validate submission
 
@@ -12,3 +12,6 @@ validate:
 
 submission:
 	$(PYTHON) -m src.make_submission --data-dir data --sample data/submission_sample.csv --output submission.csv
+
+classic:
+	$(PYTHON) -m src.run_classic --submission seq_ease
