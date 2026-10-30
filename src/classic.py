@@ -1,4 +1,4 @@
-"""Non-transformer recommenders: popularity, ItemKNN, EASE, ALS, BPR, SLIM.
+"""Non-transformer recommenders: popularity, ItemKNN, EASE, ALS, BPR, SLIM, SeqEASE.
 
 Every model is fitted on an events frame and returns a dense score matrix
 (users x catalogue items) for the requested users; `top_k` turns it into the
@@ -35,7 +35,7 @@ class Dataset:
         X = sp.csr_matrix((vals, (rows, cols)), shape=shape)
         X.eliminate_zeros()
         self.X = X
-        # Per-user event positions; used by the gap-context model.
+        # Training events with timestamps; used by SeqEASE for event order.
         self.events = ev
 
 
@@ -154,111 +154,6 @@ class SLIM:
         return np.asarray(ds.X[u] @ self.W)
 
 
-class GapContext:
-    """
-    Uses the positions of missing events in each user's timeline.
-
-    Hidden items sit at missing `timestamp` indices, so items rated right
-    before and after a gap are its best context: users rate films in related
-    batches. A transition matrix T[i, j] counts how often j occurs within
-    `window` positions of i across all users (distance-weighted). A candidate
-    is scored by summing T over the neighbours of every gap of the user; the
-    result is blended with a global user-level model (`base`).
-    """
-
-    def __init__(self, base, window: int = 5, decay: float = 0.7, beta: float = 1.0):
-        self.base, self.window, self.decay, self.beta = base, window, decay, beta
-
-    def fit(self, ds: Dataset):
-        self.base.fit(ds)
-        n = len(ds.items)
-        ev = ds.events
-        u = ds.uidx[ev["user_id"]].to_numpy()
-        it = ds.iidx[ev["item_id"]].to_numpy()
-        t = ev["timestamp"].to_numpy()
-        order = np.lexsort((t, u))
-        u, it, t = u[order], it[order], t[order]
-        rows, cols, vals = [], [], []
-        for d in range(1, self.window + 1):
-            same = u[d:] == u[:-d]
-            dist = (t[d:] - t[:-d])[same]
-            w = self.decay ** (dist - 1)
-            a, b = it[:-d][same], it[d:][same]
-            rows += [a, b]; cols += [b, a]; vals += [w, w]
-        T = sp.csr_matrix((np.concatenate(vals).astype(np.float32),
-                           (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
-        # Normalise by item popularity to avoid recommending blockbusters everywhere.
-        pop = np.asarray(ds.X.sum(axis=0)).ravel() + 1.0
-        Dinv = sp.diags(1.0 / np.sqrt(pop))
-        self.T = (Dinv @ T @ Dinv).tocsr()
-        self._contexts = self._gap_contexts(u, it, t, len(ds.users), n)
-        return self
-
-    def _gap_contexts(self, u, it, t, n_users, n_items):
-        """Sparse users x items matrix: weight of each item as context of the user's gaps."""
-        rows, cols, vals = [], [], []
-        starts = np.r_[0, np.flatnonzero(np.diff(u)) + 1]
-        ends = np.r_[starts[1:], len(u)]
-        for s, e in zip(starts, ends):
-            ts, items = t[s:e], it[s:e]
-            full = np.arange(ts[-1] + 1)
-            gaps = np.setdiff1d(full, ts, assume_unique=True)
-            # A trailing gap after the last observed event is unknown; use the tail as context too.
-            gaps = np.r_[gaps, ts[-1] + 1]
-            pos = np.searchsorted(ts, gaps)
-            w = np.zeros(len(items), dtype=np.float32)
-            for off in range(1, self.window + 1):
-                for idx in (pos - off, pos + off - 1):
-                    ok = (idx >= 0) & (idx < len(ts))
-                    dist = np.abs(ts[idx[ok]] - gaps[ok])
-                    np.add.at(w, idx[ok], self.decay ** (dist - 1))
-            nz = np.flatnonzero(w)
-            rows.append(np.full(len(nz), u[s])); cols.append(items[nz]); vals.append(w[nz])
-        return sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                             shape=(n_users, n_items))
-
-    def score(self, ds: Dataset, u: np.ndarray) -> np.ndarray:
-        base = self.base.score(ds, u)
-        ctx = np.asarray((self._contexts[u] @ self.T).todense())
-        return _rownorm(base) + self.beta * _rownorm(ctx)
-
-
-def _rownorm(S: np.ndarray) -> np.ndarray:
-    S = S - S.mean(axis=1, keepdims=True)
-    return S / (S.std(axis=1, keepdims=True) + 1e-9)
-
-
-# ---------------------------------------------------------------- helpers
-
-def top_k(model, ds: Dataset, users, k: int = 100, batch: int = 1024) -> pd.DataFrame:
-    """Top-k unseen items per user in the shared format: user_id, item_id, score, rank."""
-    u_all = ds.uidx[np.asarray(users)].to_numpy()
-    out = []
-    for s in range(0, len(u_all), batch):
-        u = u_all[s:s + batch]
-        S = model.score(ds, u).astype(np.float32)
-        S[ds.seen[u].nonzero()] = -np.inf
-        idx = np.argpartition(-S, k, axis=1)[:, :k]
-        sc = np.take_along_axis(S, idx, axis=1)
-        o = np.argsort(-sc, axis=1, kind="stable")
-        idx, sc = np.take_along_axis(idx, o, axis=1), np.take_along_axis(sc, o, axis=1)
-        out.append(pd.DataFrame({
-            "user_id": np.repeat(ds.users[u], k),
-            "item_id": ds.items[idx.ravel()],
-            "score": sc.ravel(),
-            "rank": np.tile(np.arange(1, k + 1), len(u)),
-        }))
-    return pd.concat(out, ignore_index=True)
-
-
-def recall(cands: pd.DataFrame, truth: pd.DataFrame, k: int = 10) -> float:
-    """Mean per-user recall@k: |top-k ∩ held-out| / |held-out|."""
-    top = cands[cands["rank"] <= k][["user_id", "item_id"]]
-    hits = top.merge(truth[["user_id", "item_id"]], on=["user_id", "item_id"]).groupby("user_id").size()
-    n_rel = truth.groupby("user_id").size()
-    return float((hits.reindex(n_rel.index, fill_value=0) / n_rel).mean())
-
-
 class SeqEASE:
     """
     Sequential blend for a test made of each user's latest events.
@@ -302,3 +197,39 @@ class SeqEASE:
         base = np.asarray(self.X_recent[u] @ self.ease.B)
         trans = np.asarray((self.X_last[u] @ self.T).todense())
         return _rownorm(base) + self.beta * _rownorm(trans)
+
+
+def _rownorm(S: np.ndarray) -> np.ndarray:
+    S = S - S.mean(axis=1, keepdims=True)
+    return S / (S.std(axis=1, keepdims=True) + 1e-9)
+
+
+# ---------------------------------------------------------------- helpers
+
+def top_k(model, ds: Dataset, users, k: int = 100, batch: int = 1024) -> pd.DataFrame:
+    """Top-k unseen items per user in the shared format: user_id, item_id, score, rank."""
+    u_all = ds.uidx[np.asarray(users)].to_numpy()
+    out = []
+    for s in range(0, len(u_all), batch):
+        u = u_all[s:s + batch]
+        S = model.score(ds, u).astype(np.float32)
+        S[ds.seen[u].nonzero()] = -np.inf
+        idx = np.argpartition(-S, k, axis=1)[:, :k]
+        sc = np.take_along_axis(S, idx, axis=1)
+        o = np.argsort(-sc, axis=1, kind="stable")
+        idx, sc = np.take_along_axis(idx, o, axis=1), np.take_along_axis(sc, o, axis=1)
+        out.append(pd.DataFrame({
+            "user_id": np.repeat(ds.users[u], k),
+            "item_id": ds.items[idx.ravel()],
+            "score": sc.ravel(),
+            "rank": np.tile(np.arange(1, k + 1), len(u)),
+        }))
+    return pd.concat(out, ignore_index=True)
+
+
+def recall(cands: pd.DataFrame, truth: pd.DataFrame, k: int = 10) -> float:
+    """Mean per-user recall@k: |top-k ∩ held-out| / |held-out|."""
+    top = cands[cands["rank"] <= k][["user_id", "item_id"]]
+    hits = top.merge(truth[["user_id", "item_id"]], on=["user_id", "item_id"]).groupby("user_id").size()
+    n_rel = truth.groupby("user_id").size()
+    return float((hits.reindex(n_rel.index, fill_value=0) / n_rel).mean())

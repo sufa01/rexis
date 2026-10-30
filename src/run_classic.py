@@ -1,7 +1,7 @@
 """Validate non-transformer models and export top-N candidates for the ranker (role 3).
 
 For every model:
-  1. fit on the train part of the validation split (default: latest n/9 events per user held out), report Recall@10 on the held-out events,
+  1. fit on the train part of the team leave-last-out split, report Recall@10 on the held-out events,
      save candidates to candidates/val_<model>.csv.gz;
   2. refit on all events, save candidates for all users to candidates/test_<model>.csv.gz.
 Format: user_id, item_id, score, rank (rank 1 = best), seen items excluded.
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from src.split import random_holdout, tail_holdout
+from src.validation import leave_last_out
 from src import classic as C
 
 SEED = 42
@@ -25,11 +25,10 @@ def build_models() -> dict:
         "popular": lambda: C.Popular(),
         "itemknn": lambda: C.ItemKNN(k=50, shrink=0, alpha=0.7),
         "ease": lambda: C.EASE(reg=400),
-        "als": lambda: C.ImplicitMF("als", factors=64, reg=1.0, iterations=20, alpha=5),
+        "als": lambda: C.ImplicitMF("als", factors=128, reg=1.0, iterations=20, alpha=5),
         "bpr": lambda: C.ImplicitMF("bpr", factors=64, reg=0.01, iterations=100, lr=0.01),
         "slim": lambda: C.SLIM(l1=1e-3, l2=1e-2, k=100),
-        "ease_gap": lambda: C.GapContext(C.EASE(reg=400), window=2, decay=0.8, beta=0.7),
-        "seq_ease": lambda: C.SeqEASE(reg=400, h_ease=5, horizon=20, decay=0.9, last_n=10, h_last=3, beta=2),
+        "seq_ease": lambda: C.SeqEASE(reg=400, h_ease=5, horizon=10, decay=0.8, last_n=10, h_last=3, beta=1),
     }
 
 
@@ -41,8 +40,6 @@ def main():
     parser.add_argument("--models", nargs="+", default=list(models), choices=list(models))
     parser.add_argument("--n-candidates", type=int, default=100)
     parser.add_argument("--no-test", action="store_true", help="only validate, skip the full refit")
-    parser.add_argument("--split", choices=["tail", "random"], default="tail",
-                        help="tail = latest n/9 events of each user (matches the LB)")
     parser.add_argument("--submission", type=str, default=None,
                         help="write submission.csv from this model's full refit")
     args = parser.parse_args()
@@ -52,8 +49,7 @@ def main():
     items = pd.read_csv(args.data_dir / "item_features.csv")["item_id"].to_numpy()
     sample = pd.read_csv(args.data_dir / "submission_sample.csv")
     users = np.sort(events["user_id"].unique())
-    train, truth = (tail_holdout(events) if args.split == "tail"
-                    else random_holdout(events, seed=SEED))
+    train, truth = leave_last_out(events)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     ds_val = C.Dataset(train, users, items)
     ds_full = C.Dataset(events, users, items)

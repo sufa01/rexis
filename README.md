@@ -59,12 +59,12 @@ user_id,item_id
 ## Модели без трансформеров (роль 3)
 
 ```bash
-python -m src.run_classic --submission seq_ease
+make classic   # = python -m src.run_classic --submission seq_ease
 ```
 
-Модели: popular, ItemKNN, EASE, ALS, BPR, SLIM, EASE + контекст дыр (`ease_gap`), EASE со свежестью + переходы (`seq_ease`, лучшая). Скрипт:
-- валидирует каждую модель на `tail_holdout` (см. `src/split.py`: у каждого пользователя откладываются последние n/9 событий; это совпадает с лидербордом);
-- сохраняет топ-100 кандидатов в `candidates/val_<model>.csv.gz` и `candidates/test_<model>.csv.gz`;
-- пишет `submission.csv` по выбранной модели.
+Модели: popular, ItemKNN, EASE, ALS, BPR, SLIM и `seq_ease` (лучшая): EASE с весом свежести + переходы между фильмами. Скрипт:
+- валидирует каждую модель на общем `leave_last_out` (`src/validation.py`);
+- сохраняет топ-100 кандидатов в `candidates/val_<model>.csv.gz` и `candidates/test_<model>.csv.gz` для ансамбля (роль 4);
+- пишет `submission.csv` по `seq_ease`.
 
-Весь прогон ~2.5 минуты на CPU. Результаты описаны в `EXPERIMENTS.md`.
+Весь прогон занимает ~2.5 минуты на CPU. Результаты описаны в `EXPERIMENTS.md`.
