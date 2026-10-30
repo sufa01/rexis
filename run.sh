@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-#запуск из корня проекта
+# запуск из корня проекта
 cd "$(dirname "$0")"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# --- установка зависимостей ---
+if [[ -f requirements.txt ]]; then
+  echo '[0/4] Установка зависимостей из requirements.txt'
+  "$PYTHON_BIN" -m pip install --upgrade pip
+  "$PYTHON_BIN" -m pip install -r requirements.txt
+else
+  echo 'Предупреждение: requirements.txt не найден, пропускаю установку зависимостей' >&2
+fi
+# ------------------------------
 
 for f in data/events.csv data/user_features.csv data/item_features.csv data/submission_sample.csv role4_inputs/sasrec_scores.csv role4_inputs/sasrec_full_scores.csv; do
   if [[ ! -f "$f" ]]; then
